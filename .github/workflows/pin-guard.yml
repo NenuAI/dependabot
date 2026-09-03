@@ -1,0 +1,105 @@
+name: pin-guard
+
+# Fails a PR that introduces a `uses:` reference which is not pinned to a full
+# 40-character commit SHA (NenuAI/projects#4316). A tag or branch can be moved
+# by whoever owns it, so an unpinned reference changes what our pipeline runs
+# with no PR, no diff and no alert — the risk is highest on the actions that
+# hold credentials or gate a prod deploy.
+#
+# NO `paths:` filter, deliberately. Once this is a REQUIRED check on `main`, a
+# check that never starts is never reported and the PR deadlocks waiting on it
+# (the trap documented in cloud/.github/workflows/actionlint.yml, #1724). The
+# job is a grep; it costs a few seconds, so it just runs on every PR.
+#
+# ADVISORY until the `pin-guard` context is added to branch protection on
+# `main`; once it is there, it blocks.
+on:
+  # NO `branches:` filter. Sibling PR workflows in this repo run on PRs to any
+  # base, so scoping the gate to `main` would let a PR onto another base run
+  # every other check and silently skip this one.
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # `pin-guard` is the context string to require in branch protection. Pinned
+  # explicitly so renaming the job id cannot silently stop gating.
+  pin-guard:
+    name: pin-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          # Nothing here pushes — keep the token out of `.git/config`.
+          persist-credentials: false
+
+      - name: Every `uses:` must be pinned to a full commit SHA
+        run: |
+          set -euo pipefail
+
+          # `find` over both workflow locations. A missing dir is not an error:
+          # some repos have no composite actions.
+          FILES=$(
+            { find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null || true
+              find .github/actions -type f \( -name 'action.yml' -o -name 'action.yaml' \) 2>/dev/null || true
+            } | sort
+          )
+          [ -n "$FILES" ] || { echo "pin-guard: no workflow files found"; exit 0; }
+
+          # One awk pass per file. `uses:` must start the line (optionally after
+          # a list dash) so a commented-out example cannot trip the guard.
+          # Interval expressions like {40} are avoided on purpose — mawk's
+          # support for them is not something to bet a required check on.
+          # awk runs in a `while` body inside a command substitution, so
+          # `set -e` does NOT propagate its failure — only the LAST iteration's
+          # status survives. An unreadable file would be skipped silently and
+          # this gate would report green. A security check must fail closed, so
+          # a failure emits a sentinel line that is checked for below.
+          VIOLATIONS=$(
+            printf '%s\n' "$FILES" | while IFS= read -r f; do
+              awk -v F="$f" '
+                /^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*/ {
+                  v = $0
+                  sub(/^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*/, "", v)
+                  sub(/[[:space:]]*#.*$/, "", v)
+                  gsub(/["'"'"']/, "", v)
+                  if (v == "") next
+                  if (v ~ /^\.\//) next            # local action in this repo
+                  if (v ~ /\$\{\{/) next           # expression: not statically checkable
+                  n = index(v, "@")
+                  if (n > 0) {
+                    rev = substr(v, n + 1)
+                    if (rev ~ /^[0-9a-f]+$/ && length(rev) == 40) next        # pinned
+                    if (rev ~ /^sha256:[0-9a-f]+$/ && length(rev) == 71) next # docker digest
+                  }
+                  printf "%s:%d: %s\n", F, NR, v
+                }' "$f" || printf 'UNREADABLE:%s\n' "$f"
+            done
+          )
+
+          if printf '%s\n' "$VIOLATIONS" | grep -q '^UNREADABLE:'; then
+            echo "pin-guard: FAIL — could not scan these files, so the tree is"
+            echo "unverified. Refusing to report green on an incomplete scan:"
+            printf '%s\n' "$VIOLATIONS" | sed -n 's/^UNREADABLE:/  /p'
+            exit 1
+          fi
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo "pin-guard: FAIL — these references are not pinned to a commit SHA:"
+            printf '%s\n' "$VIOLATIONS" | sed 's/^/  /'
+            echo
+            echo "Pin each one to the full 40-char SHA the tag points at today and keep"
+            echo "the version beside it, so Dependabot can still offer updates:"
+            echo "  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0"
+            echo
+            echo "Resolve a tag with:"
+            echo "  gh api repos/<owner>/<repo>/commits/<tag> --jq .sha"
+            exit 1
+          fi
+          echo "pin-guard: OK — every \`uses:\` is pinned to a commit SHA"
